@@ -71,7 +71,7 @@ async fn setup_registry() {
         REGISTRY
             .end
             .lock()
-            .expect("Bug: Multiple registies")
+            .expect("Bug: Multiple registries")
             .take()
             .expect("Bug: Registry was not initialized")
     };
@@ -79,22 +79,30 @@ async fn setup_registry() {
         REGISTRY
             .shutdown_end
             .lock()
-            .expect("Bug: Multiple registies")
+            .expect("Bug: Multiple registries")
             .take()
             .expect("Bug: Registry was not initialized")
     };
     let mut shutdown = shutdown.into_stream();
-    while let futures::future::Either::Left((Some(request), _)) =
-        futures::future::select(end.next(), shutdown.next()).await
-    {
-        let channel = request.channel.clone();
-        let r = request
-            .response
-            .send(channels.get_or_create(&request.channel));
-        ok!(
-            r,
-            error!(msg = "Failed to get channel", actor = channel.actor, direction = ?channel.direction, side = ?channel.side)
-        );
+    loop {
+        let f1 = end.next();
+        let f2 = shutdown.next();
+        tokio::pin!(f1);
+        tokio::pin!(f2);
+        if let futures::future::Either::Left((Some(request), _)) =
+            futures::future::select(f1, f2).await
+        {
+            let channel = request.channel.clone();
+            let r = request
+                .response
+                .send(channels.get_or_create(&request.channel));
+            ok!(
+                r,
+                error!(msg = "Failed to get channel", actor = channel.actor, direction = ?channel.direction, side = ?channel.side)
+            );
+        } else {
+            break;
+        }
     }
 }
 
@@ -194,7 +202,7 @@ impl From<&ActorChannel> for Key {
     }
 }
 
-fn create<M: Send + 'static>() -> Opaque {
+fn create<M: Clone + Send + 'static>() -> Opaque {
     let (start, _) = sync::broadcast::channel::<M>(CAPACITY);
     Arc::new(start)
 }
@@ -242,13 +250,29 @@ impl<T> TryFrom<Channel<T>> for EndType<T> {
     }
 }
 
-pub async fn get_channel<T: Send + 'static>(
+pub async fn get_channel_end<T: Clone + Send + 'static>(
+    actor: Actor,
+    channel_name: ChannelName,
+    direction: Direction,
+) -> SimmerResult<EndType<T>> {
+    EndType::try_from(get_channel(actor, channel_name, direction, Side::End).await?)
+}
+
+pub async fn get_channel_start<T: Clone + Send + 'static>(
+    actor: Actor,
+    channel_name: ChannelName,
+    direction: Direction,
+) -> SimmerResult<StartType<T>> {
+    StartType::try_from(get_channel(actor, channel_name, direction, Side::Start).await?)
+}
+
+pub async fn get_channel<T: Clone + Send + 'static>(
     actor: Actor,
     channel_name: ChannelName,
     direction: Direction,
     side: Side,
 ) -> SimmerResult<Channel<T>> {
-    let mut registry = REGISTRY.request.clone();
+    let registry = REGISTRY.request.clone();
     let (response, publisher) = sync::oneshot::channel();
     let request = ChannelRequest {
         channel: ActorChannel {
@@ -279,8 +303,8 @@ pub async fn wait_till_online(actor: Actor) -> SimmerResult<()> {
 
     loop {
         match online_out_e.recv().await {
-            Err(sync::broadcast::RecvError::Lagged(_)) => continue,
-            Err(sync::broadcast::RecvError::Closed) => {
+            Err(sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(sync::broadcast::error::RecvError::Closed) => {
                 panic!("Bug: Channel should never be able to close after a get_channel")
             }
             Ok(_) => break,
